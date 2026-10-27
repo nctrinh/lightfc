@@ -25,6 +25,11 @@ for p in backbone_template backbone_search fusion_head; do
   python quantize_lightfc.py --part $p --quant_mode calib --weights $W --cfg_file $C --data_dir $D
   python quantize_lightfc.py --part $p --quant_mode test  --weights $W --cfg_file $C --data_dir $D
 done
+# 2b) task-level check of the int8 parts (needs the *_int.pt written by the test runs)
+python eval_e2e.py --weights $W --cfg_file $C --geotext_dir $G --geotext_split val --samples 300
+# 2c) if backbone accuracy is too low: AdaQuant fast finetune, pass the flag to BOTH runs
+python quantize_lightfc.py --part backbone_search --quant_mode calib --fast_finetune ...
+python quantize_lightfc.py --part backbone_search --quant_mode test  --fast_finetune ...
 # 3) compile each quantized xmodel for YOUR board (board-specific, arch.json comes with the DPU IP)
 vai_c_xir -x quantize_lightfc_result/<part>/<Wrapper>_int.xmodel -a <arch.json> -o <out_dir> -n <part>
 ```
@@ -40,6 +45,11 @@ visible frame of the same object, with no gap limit unless `--max_gap` is set. S
 
 When both are given, a source is picked with probability proportional to its number of sequences
 (`TUSampler` with `p_datasets=None`). `--template_mode rgb` switches the template to colour, as in `lib_orin`'s test `initialize()`.
+
+## Reading the quantization numbers
+The per-part cosine similarity printed by `--quant_mode test` uses **float inputs** for each part, so errors
+don't accumulate there. `eval_e2e.py` runs the whole pipeline (F / QB / QH / Q variants) and reports what
+matters for tracking: IoU against GT and against float, whether the argmax matches, and the score error.
 
 ## Smoke test (run this first, in your training env)
 `python smoke_test.py` builds random weights, a placeholder config and fake GOT-10k / GeoText-1652 folders in a temp dir.

@@ -284,11 +284,19 @@ class _PairsBase:
         return crop
 
     def search(self, img_rgb):
+        return self.search_with_info(img_rgb)[0]
+
+    def search_with_info(self, img_rgb):
         # lib_orin/test/tracker/lightfc.py:track -> gray x3 -> prutils.resize (letterbox, zero pad).
-        resized_images, _ = self.prutils.resize(self._gray3(img_rgb))
-        return resized_images[0]
+        resized_images, resize_infos = self.prutils.resize(self._gray3(img_rgb))
+        return resized_images[0], resize_infos[0]  # (scale, left, top)
 
     def sample(self, rng):
+        z, x, _, _ = self.sample_with_gt(rng)
+        return z, x
+
+    def sample_with_gt(self, rng):
+        """(template crop, letterboxed search, search GT box xywh in original pixels, (scale, left, top))."""
         for _ in range(50):
             seq_idx, t = self.index[rng.randrange(len(self.index))]
             _, frames, boxes, visible = self.sequences[seq_idx]
@@ -301,8 +309,8 @@ class _PairsBase:
                 z = self.template(self._read_rgb(frames[t]), boxes[t])
             except Exception:  # sample_target raises on degenerate boxes
                 continue
-            x = self.search(self._read_rgb(frames[s]))
-            return z, x
+            x, info = self.search_with_info(self._read_rgb(frames[s]))
+            return z, x, boxes[s].copy(), info
         raise RuntimeError(f"[{self.name}] could not draw a valid calibration pair in 50 tries")
 
 
@@ -429,8 +437,14 @@ class MixedPairs:
         self.sources = sources
         self.weights = [len(s.sequences) for s in sources]
 
+    def _pick(self, rng):
+        return rng.choices(self.sources, weights=self.weights)[0]
+
     def sample(self, rng):
-        return rng.choices(self.sources, weights=self.weights)[0].sample(rng)
+        return self._pick(rng).sample(rng)
+
+    def sample_with_gt(self, rng):
+        return self._pick(rng).sample_with_gt(rng)
 
     def describe(self):
         return ", ".join(f"{s.name}: {len(s.sequences)} sequences / {len(s)} template frames" for s in self.sources)
@@ -532,6 +546,13 @@ def check_float_equivalence(base_model, pairs, rng, device, n=4, atol=1e-4):
     return errs
 
 
+def run_batches(model, batches, device):
+    """Forward pass over pre-built batches (the evaluate function fast_finetune expects)."""
+    with torch.no_grad():
+        for batch in batches:
+            model(*(t.to(device) for t in batch))
+
+
 def write_io_contract(path, args, geometry, part, inputs, outputs):
     contract = {
         "part": part,
@@ -605,6 +626,9 @@ def main():
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--export_onnx", action="store_true", help="Also export the float wrapper to ONNX.")
     parser.add_argument("--skip_float_check", action="store_true")
+    parser.add_argument("--fast_finetune", action="store_true",
+                        help="Vitis AI fast finetune (AdaQuant). Pass it to BOTH the calib and the test run.")
+    parser.add_argument("--ft_samples", type=int, default=200, help="Samples used by --fast_finetune.")
     args = parser.parse_args()
 
     import_lib_orin(os.path.abspath(args.lib_root))
@@ -642,8 +666,9 @@ def main():
     with torch.no_grad():
         example_out = wrapped(*example)
     example_out = example_out if isinstance(example_out, tuple) else (example_out,)
-    write_io_contract(os.path.join(part_output_dir, "io_contract.json"), args, geometry, args.part,
-                      dict(zip(input_names(args.part), example)), dict(zip(output_names(args.part), example_out)))
+    if args.quant_mode != "test":  # calib/float own the contract; test must not overwrite calibration_data
+        write_io_contract(os.path.join(part_output_dir, "io_contract.json"), args, geometry, args.part,
+                          dict(zip(input_names(args.part), example)), dict(zip(output_names(args.part), example_out)))
 
     if args.export_onnx:
         onnx_path = os.path.join(part_output_dir, f"{args.part}.onnx")
@@ -662,6 +687,15 @@ def main():
     quantizer = torch_quantizer(quant_mode=args.quant_mode, module=wrapped, input_args=example,
                                 output_dir=part_output_dir)
     quant_model = quantizer.quant_model
+
+    if args.fast_finetune:
+        if args.quant_mode == "calib":
+            # Layer-wise weight rounding/bias tuning on real inputs; must run before the calibration pass.
+            ft_batches = [tuple(t.cpu() for t in b) for b in iterate_batches(
+                args.part, base_model, pairs, rng, args.ft_samples, args.batch_size, device)]
+            quantizer.fast_finetune(run_batches, (quant_model, ft_batches, device))
+        else:
+            quantizer.load_ft_param()
 
     if args.quant_mode == "calib":
         with torch.no_grad():
@@ -694,7 +728,8 @@ def main():
                   f"mean MSE = {sums[name][1] / args.eval_samples:.6f}")
         print("=" * 50 + "\n")
 
-        quantizer.export_torch_script()
+        # default output_dir is ./quantize_result for every part -> the two backbones overwrote each other
+        quantizer.export_torch_script(output_dir=part_output_dir)
         quantizer.export_xmodel(output_dir=part_output_dir, deploy_check=False)
         print(f"[test:{args.part}] exported xmodel to {part_output_dir}")
 
