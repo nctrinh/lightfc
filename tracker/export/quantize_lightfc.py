@@ -22,8 +22,9 @@ Changes vs. the previous script (see TRACKER_UPDATE_PLAN.md section 0.1, S1-S10)
   S3  template: sample_target(GT box, TEMPLATE_FACTOR, TEMPLATE_SIZE) on the gray x3
       frame (training uses ToGrayscale(p=1) jointly). --template_mode rgb is available
       to reproduce lib_orin's test initialize(), which crops from the colour frame.
-  S4  template/search pairs come from the SAME GOT-10k sequence (template = GT crop,
-      search = a later frame) so corr calibration sees real correlation peaks.
+  S4  template/search pairs come from the SAME sequence (template = GT crop, search = another
+      visible frame, sampled like lib_orin TUSampler) so corr calibration sees real correlation
+      peaks. Sources: GOT-10k (--data_dir) and/or GeoText-1652 (--geotext_dir).
   S8  --weights / --cfg_file are required (no hard-coded checkpoint).
   S9  calibration runs over --calib_samples images in mini-batches.
   S10 lib_orin is imported as package `lib` at runtime (read-only, nothing copied).
@@ -35,6 +36,7 @@ New:
 Usage (each part twice, calib then test; Vitis AI docker, pytorch_nndct installed):
     python quantize_lightfc.py --part backbone_template --quant_mode calib --weights W --cfg_file C --data_dir D
     python quantize_lightfc.py --part backbone_template --quant_mode test  --weights W --cfg_file C --data_dir D
+    (calibration data: --data_dir GOT-10k and/or --geotext_dir GeoText-1652 [--geotext_split train|val|all])
     ... same for --part backbone_search and --part fusion_head
 Hardware-agnostic float export (any toolchain that takes ONNX):
     python quantize_lightfc.py --part fusion_head --quant_mode float --export_onnx ...
@@ -45,7 +47,9 @@ import importlib.util
 import json
 import os
 import random
+import re
 import sys
+from collections import defaultdict
 
 import cv2
 import numpy as np
@@ -218,35 +222,42 @@ def read_tracking_geometry(cfg):
 
 
 # ----------------------------------------------------------------------------
-# Calibration data: GOT-10k train (<data_dir>/<seq>/*.jpg + groundtruth.txt)
+# Calibration data: GOT-10k train and/or GeoText-1652 (same-sequence template/search pairs)
 # ----------------------------------------------------------------------------
-class Got10kPairs:
-    """Random (template, search) pairs from the same sequence, preprocessed exactly like lib_orin."""
+class _PairsBase:
+    """
+    Random (template, search) pairs preprocessed exactly like lib_orin. Subclasses fill
+    self.sequences with (name, frame_paths, boxes (N,4) xywh px, visible (N,) bool).
 
-    def __init__(self, data_dir, prutils, template_size, template_factor, template_mode="gray", max_gap=100):
+    Pair sampling mirrors lib_orin/train/data/sampler.py:TUSampler: the template is drawn
+    uniformly over all visible (sequence, frame) entries, the search frame is any OTHER
+    visible frame of the same sequence/object. max_gap (None = no limit, as in TUSampler)
+    optionally restricts |search - template|.
+    """
+
+    name = "pairs"
+
+    def __init__(self, prutils, template_size, template_factor, template_mode="gray", max_gap=None):
         self.prutils = prutils
         self.template_size = template_size
         self.template_factor = template_factor
         self.template_mode = template_mode
         self.max_gap = max_gap
         self.sequences = []
-        for seq_dir in sorted(glob.glob(os.path.join(data_dir, "*"))):
-            gt_file = os.path.join(seq_dir, "groundtruth.txt")
-            frames = sorted(glob.glob(os.path.join(seq_dir, "*.jpg")))
-            if not os.path.isfile(gt_file) or len(frames) == 0:
-                continue
-            boxes = np.loadtxt(gt_file, delimiter=",", dtype=np.float64).reshape(-1, 4)
-            n = min(len(frames), len(boxes))
-            valid = (boxes[:n, 2] > 0) & (boxes[:n, 3] > 0)
-            absence_file = os.path.join(seq_dir, "absence.label")
-            if os.path.isfile(absence_file):
-                absent = np.loadtxt(absence_file, dtype=np.int64).reshape(-1)[:n]
-                valid[:len(absent)] &= absent == 0
-            valid_ids = np.flatnonzero(valid)
-            if len(valid_ids) > 0:
-                self.sequences.append((frames[:n], boxes[:n], valid_ids))
-        if len(self.sequences) == 0:
-            raise ValueError(f"No GOT-10k style sequences (*.jpg + groundtruth.txt) found in {data_dir}")
+        self.index = []
+
+    def _finalize(self, where):
+        # TUSampler._build_index: sequences with < 2 visible frames cannot form a pair.
+        self.index = []
+        for seq_idx, (_, _, _, visible) in enumerate(self.sequences):
+            vis = np.flatnonzero(visible)
+            if len(vis) >= 2:
+                self.index.extend((seq_idx, int(f)) for f in vis)
+        if len(self.index) == 0:
+            raise ValueError(f"[{self.name}] no sequence with >= 2 visible frames found in {where}")
+
+    def __len__(self):
+        return len(self.index)
 
     @staticmethod
     def _read_rgb(path):
@@ -276,17 +287,165 @@ class Got10kPairs:
 
     def sample(self, rng):
         for _ in range(50):
-            frames, boxes, valid_ids = self.sequences[rng.randrange(len(self.sequences))]
-            t = int(valid_ids[rng.randrange(len(valid_ids))])
-            later = valid_ids[(valid_ids >= t) & (valid_ids <= t + self.max_gap)]
-            s = int(later[rng.randrange(len(later))])
+            seq_idx, t = self.index[rng.randrange(len(self.index))]
+            _, frames, boxes, visible = self.sequences[seq_idx]
+            candidates = [i for i in np.flatnonzero(visible) if i != t and
+                          (self.max_gap is None or abs(int(i) - t) <= self.max_gap)]
+            if not candidates:
+                continue
+            s = int(candidates[rng.randrange(len(candidates))])
             try:
                 z = self.template(self._read_rgb(frames[t]), boxes[t])
             except Exception:  # sample_target raises on degenerate boxes
                 continue
             x = self.search(self._read_rgb(frames[s]))
             return z, x
-        raise RuntimeError("could not draw a valid calibration pair in 50 tries")
+        raise RuntimeError(f"[{self.name}] could not draw a valid calibration pair in 50 tries")
+
+
+class Got10kPairs(_PairsBase):
+    """GOT-10k train layout: <data_dir>/<seq>/*.jpg + groundtruth.txt (+ absence.label)."""
+
+    name = "got10k"
+
+    def __init__(self, data_dir, prutils, template_size, template_factor, template_mode="gray", max_gap=None):
+        super().__init__(prutils, template_size, template_factor, template_mode, max_gap)
+        for seq_dir in sorted(glob.glob(os.path.join(data_dir, "*"))):
+            gt_file = os.path.join(seq_dir, "groundtruth.txt")
+            frames = sorted(glob.glob(os.path.join(seq_dir, "*.jpg")))
+            if not os.path.isfile(gt_file) or len(frames) == 0:
+                continue
+            boxes = np.loadtxt(gt_file, delimiter=",", dtype=np.float64).reshape(-1, 4)
+            n = min(len(frames), len(boxes))
+            visible = (boxes[:n, 2] > 0) & (boxes[:n, 3] > 0)
+            absence_file = os.path.join(seq_dir, "absence.label")
+            if os.path.isfile(absence_file):
+                absent = np.loadtxt(absence_file, dtype=np.int64).reshape(-1)[:n]
+                visible[:len(absent)] &= absent == 0
+            self.sequences.append((os.path.basename(seq_dir), frames[:n], boxes[:n], visible))
+        self._finalize(data_dir)
+
+
+class GeoText1652Pairs(_PairsBase):
+    """
+    GeoText-1652 building tracks. Mirrors lib_orin/train/dataset/geotext.py:GeoText
+    (_read_seq_list, _frame_index, _build_sequence_list, min_visible_frames) without importing
+    it - that module imports lib.train.data (jpeg4py, torch._six) and lib.train.admin.
+
+    Layout: <root>/<anno_file> (default train_box.json, a list of
+    {"image": "<...>/<seq_id>/<file>", "bboxes": [[track_id, cx, cy, w, h], ...]} with
+    normalized centre boxes) and images in <root>/images/train/<seq_id>/<file>.
+    Split ids come from lib_orin/train/data_specs/geotext_{train,val,all}.txt.
+    Every (seq_id, track_id) is one sequence; frames where the track is missing are invisible.
+    """
+
+    name = "geotext"
+    _IDX_RE = re.compile(r"(\d+)")
+    # GeoText(split=...) -> data_specs file; 'test' is the name base_functions.py uses for the val split.
+    _SPLIT_FILES = {"train": "geotext_train.txt", "val": "geotext_val.txt", "test": "geotext_val.txt",
+                    "all": "geotext_all.txt"}
+
+    def __init__(self, root, lib_root, prutils, template_size, template_factor, split="train",
+                 anno_file="train_box.json", min_visible_frames=2, template_mode="gray", max_gap=None):
+        super().__init__(prutils, template_size, template_factor, template_mode, max_gap)
+        if split not in self._SPLIT_FILES:
+            raise ValueError(f"Invalid GeoText split: {split}")
+        img_dir = os.path.join(root, "images", "train")
+        seq_ids = self._read_seq_list(os.path.join(lib_root, "train", "data_specs", self._SPLIT_FILES[split]))
+
+        with open(os.path.join(root, anno_file), "r") as fp:
+            entries = json.load(fp)
+
+        groups = defaultdict(list)
+        for e in entries:
+            rel_path = e["image"]
+            if not e.get("bboxes"):
+                continue
+            seq_id = os.path.basename(os.path.dirname(rel_path))
+            if seq_id not in seq_ids:
+                continue
+            groups[seq_id].append((self._frame_index(rel_path), rel_path, e["bboxes"]))
+
+        for seq_id in sorted(groups):
+            items = sorted(groups[seq_id], key=lambda it: it[0])
+            frame_paths = [os.path.join(img_dir, seq_id, os.path.basename(it[1])) for it in items]
+            n = len(items)
+
+            tracks = defaultdict(dict)
+            for pos, (_, _, bboxes) in enumerate(items):
+                W, H = self._image_size(frame_paths[pos])
+                for tid, cx, cy, w, h in bboxes:
+                    tid = str(int(tid))
+                    if pos in tracks[tid]:
+                        continue  # duplicate id within a frame: keep the first, as GeoText does
+                    x1 = max(0.0, (cx - w / 2) * W)
+                    y1 = max(0.0, (cy - h / 2) * H)
+                    x2 = min(float(W), (cx + w / 2) * W)
+                    y2 = min(float(H), (cy + h / 2) * H)
+                    tracks[tid][pos] = [x1, y1, x2 - x1, y2 - y1]
+
+            for tid in sorted(tracks, key=int):
+                boxes = np.zeros((n, 4), dtype=np.float64)
+                for pos, box in tracks[tid].items():
+                    boxes[pos] = box
+                visible = (boxes[:, 2] > 0) & (boxes[:, 3] > 0)
+                if int(visible.sum()) >= min_visible_frames:
+                    self.sequences.append((f"{seq_id}_{tid}", frame_paths, boxes, visible))
+        self._finalize(root)
+
+    @staticmethod
+    def _read_seq_list(path):
+        with open(path, "r") as fp:
+            return set(line.strip() for line in fp if line.strip())
+
+    def _frame_index(self, rel_path):
+        nums = self._IDX_RE.findall(os.path.basename(rel_path))
+        return int(nums[-1]) if nums else 0
+
+    @staticmethod
+    def _image_size(path):
+        # geotext.py uses PIL (header read only); fall back to cv2 if PIL is unavailable.
+        try:
+            from PIL import Image
+            with Image.open(path) as img:
+                return img.size
+        except ImportError:
+            img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+            if img is None:
+                raise IOError(f"cannot read {path}")
+            return img.shape[1], img.shape[0]
+
+
+class MixedPairs:
+    """
+    Several pair sources. Mirrors TUSampler with p_datasets=None: a source is chosen with
+    probability proportional to its number of sequences, then sampled as above.
+    """
+
+    def __init__(self, sources):
+        self.sources = sources
+        self.weights = [len(s.sequences) for s in sources]
+
+    def sample(self, rng):
+        return rng.choices(self.sources, weights=self.weights)[0].sample(rng)
+
+    def describe(self):
+        return ", ".join(f"{s.name}: {len(s.sequences)} sequences / {len(s)} template frames" for s in self.sources)
+
+
+def build_pairs(args, prutils, geometry):
+    common = dict(prutils=prutils, template_size=geometry["template_size"],
+                  template_factor=geometry["template_factor"], template_mode=args.template_mode,
+                  max_gap=args.max_gap)
+    sources = []
+    if args.data_dir:
+        sources.append(Got10kPairs(args.data_dir, **common))
+    if args.geotext_dir:
+        sources.append(GeoText1652Pairs(args.geotext_dir, os.path.abspath(args.lib_root), split=args.geotext_split,
+                                        anno_file=args.geotext_anno, **common))
+    if not sources:
+        raise SystemExit("give at least one calibration dataset: --data_dir (GOT-10k) and/or --geotext_dir")
+    return MixedPairs(sources)
 
 
 def to_normalized_tensor(images_hwc_uint8):
@@ -376,6 +535,8 @@ def write_io_contract(path, args, geometry, part, inputs, outputs):
         "source": "tracker/export/quantize_lightfc.py (mirrors lib_orin)",
         "weights": os.path.abspath(args.weights),
         "cfg_file": os.path.abspath(args.cfg_file),
+        "calibration_data": {"got10k": args.data_dir, "geotext": args.geotext_dir,
+                             "geotext_split": args.geotext_split if args.geotext_dir else None},
         "layout_note": "shapes below are PyTorch NCHW; compiled DPU graphs use NHWC",
         "inputs": {name: list(t.shape) for name, t in inputs.items()},
         "outputs": {name: list(t.shape) for name, t in outputs.items()},
@@ -421,8 +582,13 @@ def main():
                              "calib: collect activation statistics. test: evaluate and export the xmodel.")
     parser.add_argument("--weights", type=str, required=True, help="Checkpoint .pth.tar (e.g. LightFC_best.pth.tar).")
     parser.add_argument("--cfg_file", type=str, required=True, help="Experiment yaml used to train the checkpoint.")
-    parser.add_argument("--data_dir", type=str, required=True,
+    parser.add_argument("--data_dir", type=str, default=None,
                         help="GOT-10k train folder: <data_dir>/<seq>/*.jpg + groundtruth.txt.")
+    parser.add_argument("--geotext_dir", type=str, default=None,
+                        help="GeoText-1652 root: <root>/train_box.json + <root>/images/train/<seq_id>/.")
+    parser.add_argument("--geotext_split", type=str, default="train", choices=["train", "val", "all"],
+                        help="lib_orin/train/data_specs/geotext_{split}.txt")
+    parser.add_argument("--geotext_anno", type=str, default="train_box.json", help="Annotation json under --geotext_dir.")
     parser.add_argument("--output_dir", type=str, default="./quantize_lightfc_result",
                         help="Root output folder (one sub-folder per --part).")
     parser.add_argument("--lib_root", type=str, default=DEFAULT_LIB_ROOT, help="Path to lib_orin/.")
@@ -431,7 +597,8 @@ def main():
     parser.add_argument("--calib_samples", type=int, default=200, help="Number of calibration samples.")
     parser.add_argument("--eval_samples", type=int, default=16, help="Samples for float-vs-quant similarity.")
     parser.add_argument("--batch_size", type=int, default=8, help="Mini-batch size during calibration.")
-    parser.add_argument("--max_gap", type=int, default=100, help="Max frame gap between template and search.")
+    parser.add_argument("--max_gap", type=int, default=None,
+                        help="Max |search - template| frame gap. Default: none, like lib_orin TUSampler.")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--export_onnx", action="store_true", help="Also export the float wrapper to ONNX.")
     parser.add_argument("--skip_float_check", action="store_true")
@@ -454,9 +621,8 @@ def main():
     geometry = read_tracking_geometry(cfg)
     base_model = load_model(args.weights, cfg).to(device)
 
-    pairs = Got10kPairs(args.data_dir, prutils, geometry["template_size"], geometry["template_factor"],
-                        template_mode=args.template_mode, max_gap=args.max_gap)
-    print(f"[data] {len(pairs.sequences)} sequences in {args.data_dir}")
+    pairs = build_pairs(args, prutils, geometry)
+    print(f"[data] {pairs.describe()}")
 
     if not args.skip_float_check:
         check_float_equivalence(base_model, pairs, rng, device)

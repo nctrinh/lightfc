@@ -30,11 +30,19 @@ vai_c_xir -x quantize_lightfc_result/<part>/<Wrapper>_int.xmodel -a <arch.json> 
 ```
 
 The script uses the exact `lib_orin` preprocessing: gray ×3, `sample_target` template from the GT box,
-letterboxed search, and ImageNet mean/std. Template/search calibration pairs come from the same GOT-10k
-sequence. `--template_mode rgb` switches the template to colour, as in `lib_orin`'s test `initialize()`.
+letterboxed search, and ImageNet mean/std. Template/search calibration pairs come from the same sequence and are
+sampled like `lib_orin`'s `TUSampler`: the template is any visible frame, the search frame is any *other*
+visible frame of the same object, with no gap limit unless `--max_gap` is set. Sources:
+- `--data_dir`: GOT-10k train (`<seq>/*.jpg`, `groundtruth.txt`, `absence.label`)
+- `--geotext_dir [--geotext_split train|val|all] [--geotext_anno train_box.json]`: GeoText-1652. Parsing
+  mirrors `lib_orin/train/dataset/geotext.py`, and split ids come from `lib_orin/train/data_specs/geotext_*.txt`.
+  Each (sequence, building id) is one track.
+
+When both are given, a source is picked with probability proportional to its number of sequences
+(`TUSampler` with `p_datasets=None`). `--template_mode rgb` switches the template to colour, as in `lib_orin`'s test `initialize()`.
 
 ## Smoke test (run this first, in your training env)
-`python smoke_test.py` builds random weights, a placeholder config and a fake GOT-10k folder in a temp dir.
+`python smoke_test.py` builds random weights, a placeholder config and fake GOT-10k / GeoText-1652 folders in a temp dir.
 It then runs the float path for all parts (including the equivalence check against `lib_orin`'s forward) and,
 if Vitis AI is absent, the calib/test control flow with a stub quantizer. It needs no checkpoint or dataset.
 

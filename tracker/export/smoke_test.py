@@ -1,6 +1,6 @@
 """
 Smoke test for quantize_lightfc.py. Needs torch/cv2/timm/easydict/pyyaml/tensorboard (your training env),
-but no checkpoint, dataset or Vitis AI.
+but no checkpoint, dataset or Vitis AI. Covers GOT-10k and GeoText-1652 calibration sources.
 
 It builds a RANDOM-weight LightFC from a placeholder config (BN statistics randomized so that
 switch_to_deploy is non-trivial), writes a tiny fake GOT-10k folder, then runs:
@@ -12,6 +12,7 @@ Usage: python smoke_test.py [--lib_root ../../lib_orin] [--keep]
 The placeholder config only fixes shapes; it is NOT your experiment yaml.
 """
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -66,7 +67,18 @@ def make_fixture(root, lib_root):
             for i in range(6):
                 cv2.imwrite(os.path.join(seq, f"{i + 1:08d}.jpg"), rng.integers(0, 255, (h, w, 3), dtype=np.uint8))
                 fp.write(f"{100 + 10 * i},{80 + 5 * i},{60 + 3 * i},{40 + 2 * i}\n")
-    return cfg_file, weights, data_dir
+    # fake GeoText-1652: seq 0839 is listed in lib_orin/train/data_specs/geotext_val.txt
+    geotext_dir = os.path.join(root, "geotext")
+    seq_dir = os.path.join(geotext_dir, "images", "train", "0839")
+    os.makedirs(seq_dir)
+    entries = []
+    for i in range(4):
+        name = f"image-{i + 1:02d}.jpeg"
+        cv2.imwrite(os.path.join(seq_dir, name), rng.integers(0, 255, (512, 512, 3), dtype=np.uint8))
+        entries.append({"image": f"images/train/0839/{name}", "bboxes": [[1, 0.5 + 0.02 * i, 0.5, 0.3, 0.25]]})
+    with open(os.path.join(geotext_dir, "train_box.json"), "w") as fp:
+        json.dump(entries, fp)
+    return cfg_file, weights, data_dir, geotext_dir
 
 
 def install_stub_quantizer(calls):
@@ -114,15 +126,20 @@ def main():
 
     root = tempfile.mkdtemp(prefix="lightfc_smoke_")
     try:
-        cfg_file, weights, data_dir = make_fixture(root, lib_root)
-        common = ["--weights", weights, "--cfg_file", cfg_file, "--data_dir", data_dir, "--lib_root", lib_root,
-                  "--output_dir", os.path.join(root, "out"), "--calib_samples", "5", "--eval_samples", "2",
-                  "--batch_size", "2"]
+        cfg_file, weights, data_dir, geotext_dir = make_fixture(root, lib_root)
+        base = ["--weights", weights, "--cfg_file", cfg_file, "--lib_root", lib_root,
+                "--output_dir", os.path.join(root, "out"), "--calib_samples", "5", "--eval_samples", "2",
+                "--batch_size", "2"]
+        common = base + ["--data_dir", data_dir]
 
         for part in ["backbone_template", "backbone_search", "fusion_head"]:
             run(["--part", part, "--quant_mode", "float", "--export_onnx"] + common)
             assert os.path.isfile(os.path.join(root, "out", part, f"{part}.onnx"))
             assert os.path.isfile(os.path.join(root, "out", part, "io_contract.json"))
+        # GeoText-1652 alone, then mixed with GOT-10k
+        geo = ["--geotext_dir", geotext_dir, "--geotext_split", "val"]
+        run(["--part", "fusion_head", "--quant_mode", "float"] + base + geo)
+        run(["--part", "fusion_head", "--quant_mode", "float"] + common + geo)
 
         try:
             import pytorch_nndct  # noqa: F401
