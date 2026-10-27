@@ -42,7 +42,8 @@ if [ "$1" == "test" ]; then
      exit 0
 fi
 
-name=$(basename $PWD)
+# fixed binary name (run.sh calls ./TrackerV2), independent of the folder name
+name=TrackerV2
 if [[ "$CXX"  == *"sysroot"* ]];then
 $CXX -O2 -fno-inline -I. \
      -I=/install/Debug/include \
