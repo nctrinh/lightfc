@@ -33,6 +33,11 @@ The script uses the exact `lib_orin` preprocessing: gray ×3, `sample_target` te
 letterboxed search, and ImageNet mean/std. Template/search calibration pairs come from the same GOT-10k
 sequence. `--template_mode rgb` switches the template to colour, as in `lib_orin`'s test `initialize()`.
 
+## Smoke test (run this first, in your training env)
+`python smoke_test.py` builds random weights, a placeholder config and a fake GOT-10k folder in a temp dir.
+It then runs the float path for all parts (including the equivalence check against `lib_orin`'s forward) and,
+if Vitis AI is absent, the calib/test control flow with a stub quantizer. It needs no checkpoint or dataset.
+
 ## Target-dependent (not hard-coded here)
 - Step 3 and `pytorch_nndct` are Xilinx Vitis AI only. For another accelerator, start from the float ONNX
   (`--export_onnx`) and use that vendor's quantizer, calibrating with the same preprocessing.

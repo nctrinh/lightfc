@@ -474,8 +474,11 @@ def main():
 
     if args.export_onnx:
         onnx_path = os.path.join(part_output_dir, f"{args.part}.onnx")
-        torch.onnx.export(wrapped, example, onnx_path, opset_version=13,
-                          input_names=input_names(args.part), output_names=output_names(args.part))
+        onnx_kwargs = dict(opset_version=13, input_names=input_names(args.part), output_names=output_names(args.part))
+        try:  # torch >= 2.5 has a `dynamo` switch (default True from 2.9); keep the TorchScript exporter
+            torch.onnx.export(wrapped, example, onnx_path, dynamo=False, **onnx_kwargs)
+        except TypeError:  # older torch (e.g. Vitis AI docker): no `dynamo` argument
+            torch.onnx.export(wrapped, example, onnx_path, **onnx_kwargs)
         print(f"[float:{args.part}] exported {onnx_path}")
 
     if args.quant_mode == "float":
