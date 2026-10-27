@@ -77,6 +77,8 @@ DEFAULT_LIB_ROOT = os.path.normpath(os.path.join(_HERE, "..", "..", "lib_orin"))
 # ----------------------------------------------------------------------------
 def import_lib_orin(lib_root):
     """lib_orin's own imports say `from lib.xxx import ...`, so register lib_orin as `lib`."""
+    # lib_orin is read-only: don't leave __pycache__ folders inside it.
+    sys.dont_write_bytecode = True
     init_file = os.path.join(lib_root, "__init__.py")
     if not os.path.isfile(init_file):
         raise FileNotFoundError(f"{init_file} not found - pass --lib_root pointing at lib_orin/")
@@ -98,6 +100,7 @@ def load_processing_utils(lib_root):
     in jpeg4py and torch._six (training-only dependencies). The file itself only needs
     torch/cv2/numpy, and we use sample_target() and resize() from it unchanged.
     """
+    sys.dont_write_bytecode = True  # lib_orin is read-only
     path = os.path.join(lib_root, "train", "data", "processing_utils.py")
     spec = importlib.util.spec_from_file_location("lib_orin_processing_utils", path)
     module = importlib.util.module_from_spec(spec)
