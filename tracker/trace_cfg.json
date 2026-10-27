@@ -1,11 +1,11 @@
 {
     "options": {
         "runmode": "normal",
-        "cmd": "./TrackerV2 model/models_ZCU102 /home/root/luunp/Datasets/QDT_TIR/ship_scale1/img /home/root/luunp/Datasets/QDT_TIR/ship_scale1/groundtruth_rect.txt test_results/ship_scale1",
+        "cmd": "./TrackerV2 config/lightfc.cfg /path/to/seq/img /path/to/seq/groundtruth_rect.txt test_results/seq",
         "output": ""
     },
     "trace": {
         "enable_trace_list": ["vitis-ai-library", "vart", "custom"]
     },
-    "trace_custom": ["AITracker::preprocess", "AITracker::postprocess", "AITracker::update", "AITracker::xcorr_depthwise"]
+    "trace_custom": ["AITracker::initPreprocess", "AITracker::preprocess", "AITracker::xcorr", "AITracker::postprocess", "VART_DPU::run"]
 }

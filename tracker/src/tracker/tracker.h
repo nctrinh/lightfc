@@ -16,6 +16,7 @@ struct TrackResult
 {
     TrackerState trackState_;
     cv::Rect2f rect_;
+    float score_ = 0.f;     // model confidence (LightFC: max of the ctr score map)
 };
 
 class Tracker

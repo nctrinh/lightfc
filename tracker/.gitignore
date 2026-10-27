@@ -1,3 +1,6 @@
 __pycache__/
 *.pyc
 quantize_lightfc_result/
+TrackerV2
+test_host_ops
+test_tracker_flow

@@ -12,6 +12,8 @@
 #include <iomanip>
 #include <iostream>
 #include <queue>
+#include <sstream>
+#include <algorithm>
 #include <string>
 #include <thread>
 #include <vector>
@@ -62,13 +64,20 @@ void ListImages(string const& path, vector<string>& images) {
     closedir(dir);
 }
 
-void Str2Array(std::string text, std::vector<int> &numbers) {
-    size_t pos = 0;
-    while ((pos = text.find(',')) != std::string::npos) {
-        numbers.push_back(std::stoi(text.substr(0, pos)));
-        text.erase(0, pos + 1);
+/**
+ * @brief parse "x,y,w,h" (separators: ',', tab or space; float values, e.g. GOT-10k/LaSOT/OTB)
+ */
+bool Str2Rect(std::string text, cv::Rect2f &rect) {
+    for (auto& ch : text) {
+        if (ch == ',' || ch == '\t') ch = ' ';
     }
-    numbers.push_back(std::stoi(text.substr(0, pos)));
+    std::istringstream ss(text);
+    float v[4];
+    for (int i = 0; i < 4; i++) {
+        if (!(ss >> v[i])) return false;
+    }
+    rect = cv::Rect2f(v[0], v[1], v[2], v[3]);
+    return true;
 }
 
 void LoadRect(string const& path, std::vector<cv::Rect2f>& bboxs) {
@@ -76,9 +85,11 @@ void LoadRect(string const& path, std::vector<cv::Rect2f>& bboxs) {
     std::string info;
 
     while (std::getline(filebbox, info)) {
-        std::vector<int> bbox;
-        Str2Array(info, bbox);
-        bboxs.push_back(cv::Rect2f(bbox[0], bbox[1], bbox[2], bbox[3]));
+        cv::Rect2f rect;
+        if (!Str2Rect(info, rect)) {
+            rect = cv::Rect2f(NAN, NAN, NAN, NAN);  // keep frame alignment for unparsable / NaN lines
+        }
+        bboxs.push_back(rect);
     }
 
     filebbox.close();
@@ -89,26 +100,35 @@ int main(int argc, char* argv[])
 {
     // Check args
     if (argc < 4) {
-        cout << "Usage of deblur demo: ./Tracker [model_path] [input_folder_path] [file_box_path] [output_folder_path]" << endl;
+        cout << "Usage: ./TrackerV2 [config_file] [input_folder_path] [file_box_path] [output_folder_path]" << endl;
+        cout << "  config_file: key=value file, see config/lightfc.cfg" << endl;
         return -1;
     }
 
-    string modelPath = argv[1];
+    string configPath = argv[1];
     string baseImagePath = argv[2];
     string groundtruthbox = argv[3];
 
     string outputPath = "";
 
-    bool show = true;
     bool save = false;
     if (argc == 5) {
         outputPath = argv[4];
         save = true;
     }
 
-    AITracker tracker({modelPath + "/Init_model.xmodel", modelPath + "/Track_model1.xmodel",
-                     modelPath + "/Track_model2.xmodel", modelPath + "/Track_model3.xmodel"});
-    tracker.init();
+    LightFCConfig cfg;
+    string err;
+    if (!cfg.load(configPath, err)) {
+        cerr << "Config error: " << err << endl;
+        return 1;
+    }
+
+    AITracker tracker(cfg);
+    if (tracker.init() != InitState::Success) {
+        cerr << "Tracker init failed: " << tracker.lastError() << endl;
+        return 1;
+    }
     vector<string> list_images;
     std::vector<cv::Rect2f> bboxs;
 
@@ -116,14 +136,27 @@ int main(int argc, char* argv[])
     std::sort(list_images.begin(), list_images.end());
 
     LoadRect(groundtruthbox, bboxs);
+    if (list_images.empty() || bboxs.empty() || std::isnan(bboxs[0].width)) {
+        cerr << "No images or no valid initial box" << endl;
+        return 1;
+    }
 
-    cv::Mat firstImg = cv::imread(baseImagePath + "/" + list_images[0], cv::IMREAD_GRAYSCALE);
+    // Frames are read in colour (BGR) and converted inside the tracker with cvtColor, like lib_orin
+    // (cv.COLOR_RGB2GRAY). IMREAD_GRAYSCALE would use the JPEG decoder's own gray conversion.
+    cv::Mat firstImg = cv::imread(baseImagePath + "/" + list_images[0], cv::IMREAD_COLOR);
     tracker.initialize(firstImg, bboxs[0]);
+
+    std::ofstream results;
+    if (save) {
+        results.open(outputPath + "/results.txt");
+        const cv::Rect2f& b = bboxs[0];
+        results << b.x << "," << b.y << "," << b.width << "," << b.height << ",1" << "\n";
+    }
 
     float tracker_time = 0;
 
     for (size_t i=1; i<list_images.size(); i++) {
-        cv::Mat img = cv::imread(baseImagePath + "/" + list_images[i], cv::IMREAD_GRAYSCALE);
+        cv::Mat img = cv::imread(baseImagePath + "/" + list_images[i], cv::IMREAD_COLOR);
         auto start = GET_MOMENT;
         TrackResult track_result = tracker.update(img);
 
@@ -131,13 +164,21 @@ int main(int argc, char* argv[])
         auto stop = GET_MOMENT;
         auto duration = GET_DURATION(stop, start);
 
-        tracker_time += duration/1000;
+        tracker_time += duration/1000.f;
 
-        cv::cvtColor(img, img,  cv::COLOR_GRAY2RGB);
+        if (save) {
+            results << new_pos.x << "," << new_pos.y << "," << new_pos.width << "," << new_pos.height << ","
+                    << track_result.score_ << "\n";
+        }
+
+        if (!save && !cfg.show) continue;
+
         // Drawing the ground truth bounding box
-        cv::rectangle(img, bboxs[i].tl(), bboxs[i].br(),
-                      cv::Scalar(0, 255, 0),
-                      1, cv::LINE_8);
+        if (i < bboxs.size() && !std::isnan(bboxs[i].width)) {
+            cv::rectangle(img, bboxs[i].tl(), bboxs[i].br(),
+                          cv::Scalar(0, 255, 0),
+                          1, cv::LINE_8);
+        }
 
         // Drawing the predict bounding box
         cv::rectangle(img, new_pos.tl(), new_pos.br(),
@@ -153,7 +194,7 @@ int main(int argc, char* argv[])
             cv::imwrite(outputPath + "/" + list_images[i], img);
         }
 
-        if (show) {
+        if (cfg.show) {
             cv::imshow("Output", img);
             cv::waitKey(1);
         }

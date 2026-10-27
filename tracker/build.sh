@@ -30,6 +30,18 @@ else
      OPENCV_FLAGS=$(pkg-config --cflags --libs-only-L opencv)
 fi
 
+# ./build.sh test : host-only tests (OpenCV only, no Vitis AI), see test/ and tools/make_golden.py
+if [ "$1" == "test" ]; then
+     TEST_FLAGS="-O2 -std=c++17 -Wall -I$PWD/src/tracker -I$PWD/src/DPU $(pkg-config --cflags opencv4 2>/dev/null || pkg-config --cflags opencv)"
+     TEST_LIBS="$(pkg-config --libs opencv4 2>/dev/null || pkg-config --libs opencv) -lpthread"
+     $CXX $TEST_FLAGS -o test_host_ops $PWD/test/test_host_ops.cpp $PWD/src/tracker/lightfc_ops.cpp $TEST_LIBS || exit 1
+     $CXX $TEST_FLAGS -o test_tracker_flow $PWD/test/test_tracker_flow.cpp \
+          $PWD/src/tracker/AItracker.cpp $PWD/src/tracker/tracker.cpp $PWD/src/tracker/lightfc_ops.cpp \
+          $PWD/src/tracker/lightfc_config.cpp $PWD/src/DPU/model_runner.cpp $TEST_LIBS || exit 1
+     echo "built test_host_ops test_tracker_flow"
+     exit 0
+fi
+
 name=$(basename $PWD)
 if [[ "$CXX"  == *"sysroot"* ]];then
 $CXX -O2 -fno-inline -I. \
@@ -43,8 +55,11 @@ $CXX -O2 -fno-inline -I. \
      $PWD/src/main.cpp \
      $PWD/src/common/common.cpp  \
      $PWD/src/DPU/dpu.cpp  \
+     $PWD/src/DPU/model_runner.cpp  \
      $PWD/src/tracker/tracker.cpp  \
      $PWD/src/tracker/AItracker.cpp  \
+     $PWD/src/tracker/lightfc_ops.cpp  \
+     $PWD/src/tracker/lightfc_config.cpp  \
      -Wl,-rpath=$PWD/lib \
      -lvart-runner \
      ${OPENCV_FLAGS} \
@@ -71,8 +86,11 @@ $CXX -O2 -fno-inline -I. \
      $PWD/src/main.cpp \
      $PWD/src/common/common.cpp  \
      $PWD/src/DPU/dpu.cpp  \
+     $PWD/src/DPU/model_runner.cpp  \
      $PWD/src/tracker/tracker.cpp  \
      $PWD/src/tracker/AItracker.cpp  \
+     $PWD/src/tracker/lightfc_ops.cpp  \
+     $PWD/src/tracker/lightfc_config.cpp  \
      -Wl,-rpath=$PWD/lib \
      -lvart-runner \
      ${OPENCV_FLAGS} \
