@@ -35,6 +35,28 @@ doesn't exist, and `main.cpp` asks for filenames that aren't shipped.
 ⇒ "Updating" the C++ in practice means **re-implementing the host-side LightFC pipeline**, plus an export
 script, plus **re-exporting and re-quantizing every model**. The plan below is scoped that way.
 
+### 0.1 Update: your PTQ script (`quantize_lightfc.py`, sent after the first draft)
+It explains the 3 xmodels: `backbone_template` and `backbone_search` (same MobileNetV2 weights, compiled twice
+because the DPU needs fixed shapes) plus `fusion_head` (`corr`, `x_feat` → `raw_ctr, raw_offset, raw_size`). The
+correlation and `cal_bbox` stay on the host. That is the same split this plan uses. Checked against `lib_orin`:
+
+| # | Script today | `lib_orin` / training | Consequence |
+|---|---|---|---|
+| S1 | `FusionHeadWrapper` calls `model.forward_fusion_head_dpu` | method **removed** in `lib_orin` (DIFF §2.3) | script crashes on `lib_orin`; wrapper must call the submodules itself |
+| S2 | search: `cv2.resize(…, (640,480))` stretch | `prutils.resize` letterbox (DIFF §2.2) | calibration statistics come from the wrong input distribution |
+| S3 | template: **colour** RGB, plain resize of the whole image | training template gray p=1 (DIFF §3.2); `sample_target` crop | colour vs gray (Q2); a full-image resize doesn't look like a target crop |
+| S4 | fusion_head calib: template and search from **unrelated random images** | real use: template is a crop of the target in the search frame | corr peaks (the values that matter most) are under-represented, so the int8 range is likely clipped too tight. Calibrate on same-sequence pairs (GOT-10k `groundtruth.txt`) |
+| S5 | input 3 channels | 3 channels | ✅ answers **Q3: 3-channel** |
+| S6 | shipped xmodels are 1-channel and use the crMLP fusion | — | ✅ confirms the shipped xmodels were **not** produced by this script (probably by the `lightfc_fpga/` version the docstring mentions) |
+| S7 | docstring says template **256×256**; code uses `cfg.TEST.TEMPLATE_SIZE` | shipped template xmodel is 128 | 256 would give z 16×16 → corr **256 ch**, not 64. That changes the fusion input shape and `conv_down1` (new Q7) |
+| S8 | default `--weights …fpga_noiab/LightFC_ep0035.pth.tar` | `lib_orin` uses `…/LightFC_best.pth.tar` | make `--weights` and `--cfg_file` required |
+| S9 | 32 calibration samples | — | low; recommend ≥200 |
+| S10 | `import lib.…` | `lib_orin` imports itself as `lib` | alias `lib_orin` → `lib` at runtime (read-only, no copy) |
+
+The yaml name `…pwcorr_scf_sc_iab_sc_adj_concat_repn33_conv33_center_wiou_geom_fpga_noiab` fits
+`pwcorr_scf_sc_iab_sc_concat` + `repn33_center_concat_geom`. It weakly supports the Q6 default but doesn't prove
+which fusion the newer `building_new_model` checkpoint used.
+
 ## 1. File → component map
 
 | `tracker/` file | Function(s) | Intended `lib_*` counterpart | Verdict |
@@ -51,7 +73,7 @@ script, plus **re-exporting and re-quantizing every model**. The plan below is s
 | `src/DPU/dpu.{h,cpp}`, `src/common/common.{h,cpp}` | VART runner wrapper | none (Vitis-AI specific) | keep, put behind an interface (§4, R8) |
 | `build.sh` | g++ build against VART/XIR/OpenCV | — | add new sources and a host-test target |
 | `run.sh`, `trace_cfg.json` | demo command and profiling list | — | fix model dir and traced function names |
-| *(none)* | export / quantize | `lib_new` `forward_search_backbone` / `forward_fusion_head_dpu` (removed in `lib_orin`) | **new** `tracker/export/` |
+| *(your `quantize_lightfc.py`, not in repo yet)* | PTQ + xmodel export of the 3 parts | `lib_new` `forward_fusion_head_dpu` (removed in `lib_orin`) + `test/tracker/lightfc.py` preprocessing | **port to `tracker/export/`**, fixing S1–S10 (§0.1) |
 
 ## 2. Diff item → required tracker change
 
@@ -70,13 +92,14 @@ script, plus **re-exporting and re-quantizing every model**. The plan below is s
 
 Dependencies are marked **⇄**. Items 1–3 fix the interfaces that everything else depends on.
 
-1. **[R-HIGH] Export script** `tracker/export/export_lightfc.py` (new, Python, imports `lib_orin` read-only by aliasing it as `lib`).
-   - Build `LightFC(cfg, training=False)`, load the checkpoint, call `switch_to_deploy()` on all repN33 modules (same as `lightFC.__init__`).
-   - `BackboneWrapper(x) = model.backbone(x)`, exported twice: 1×3×128×128 and 1×3×480×640.
-   - `FusionHeadWrapper(corr, x_feat)`: `lib_orin` `pwcorr_scf_sc_iab_sc_concat.forward` **minus `pw_corr`**, then `head.get_score_map` **minus `_sigmoid`**. It calls the `lib_orin` submodules op by op, so it returns `raw_ctr, raw_offset, raw_size`.
-   - Self-check: `sigmoid/clamp(FusionHeadWrapper(pixel_wise_corr_fpga(z,x), x))` must equal `model.forward_tracking` to fp32 tolerance.
-   - Emit framework-neutral float **ONNX** + TorchScript. The quantize/compile step goes in a separate, clearly marked board-specific script (`export/quantize_vitis.sh`, Vitis AI only, untested here).
-   - ⇄ fixes corr layout (item 4), input channels (item 3), pre-sigmoid outputs (item 5).
+1. **[R-HIGH] Port your PTQ script** into `tracker/export/quantize_lightfc.py`. Keep its structure, CLI and the 6-run calib/test flow, and fix S1–S10:
+   - `lib_orin` aliased as `lib` at runtime (S10). `--weights` and `--cfg_file` required (S8).
+   - `load_model`: unchanged (load, `switch_to_deploy()` everywhere, eval). That already matches `lib_orin`.
+   - `FusionHeadWrapper.forward(corr, x_feat)` re-implements the removed split by calling `lib_orin` submodules op by op: `bn_down1(conv_down1)` → `conv1` → `bn_down2(conv_down2)` → `conv2` → `adjust` → `cat(·, x_feat)` → head ctr branch `conv1..5_ctr` and geom branch `conv1..4_geom` → `conv5_offset`, `conv5_size`. **No sigmoid.** Output order `raw_ctr, raw_offset, raw_size` (S1).
+   - Search calibration through `prutils.resize` letterbox (S2). Template through `sample_target(GT box, TEMPLATE_FACTOR, TEMPLATE_SIZE)` on gray×3 (S3, Q2), with the template and search frame from the **same GOT-10k sequence** (S4). `--calib_samples` defaults to 200 (S9).
+   - Float self-check before quantizing: `sigmoid/clamp(FusionHeadWrapper(pw_corr(z,x), x))` vs `model.forward_tracking`, plus the existing cos-sim/MSE of float vs quant.
+   - Optional `--export_onnx` (float ONNX of the same wrappers) for a non-Xilinx target. `pytorch_nndct` is imported only in the Vitis path, so the script stays usable without Vitis AI.
+   - ⇄ fixes corr layout (item 4), input channels (item 3), pre-sigmoid outputs (item 5). The C++ consumes exactly these graph I/Os.
 2. **[R-HIGH] Config replaces `hyper_params_tracker`.** New `LightFCConfig` struct: `template_size=128`, `template_factor` (**must be set, no default**, see Q4), `search_w=640`, `search_h=480`, `stride=16`, `feat_h=30`, `feat_w=40`, `feat_c=96`, `num_kernel=64`, `mean/std`, model filenames. Loaded from a small `key=value` file next to the models, so nothing is board-specific in code. Delete `XCORR_*`, `FILTER_NUMBER`, `KERNEL_*`, `window[225]`, `bi/si`, `penalty_k`, `window_influence`, `test_lr`, `context_amount`.
 3. **[R-HIGH] Preprocessing** (mirrors `lib_orin` op by op, each function commented with its source):
    - `sample_target()` ← `train/data/processing_utils.py:sample_target` (ceil, half-even round, the `+1` pad quirk, zero pad, bilinear resize).
@@ -99,7 +122,9 @@ VART-free translation units only if OpenCV can be installed. I won't claim anyth
 **Decisions I need from you (my default in bold):**
 - **Q1 – decode quirk.** `cal_bbox` uses `idx_y = idx // feat_sz[0]` (÷30) on a 40-wide map, so `cy` is wrong except in row 0. It's in both libs and in training. **Default: mirror it exactly** (you said don't invent behavior). Fixing it would also need a retrain/fine-tune and a `lib_orin` change on your side.
 - **Q2 – template colour.** Training: template gray with p=1. `lib_orin` `initialize()`: colour template. C++: gray frames. **Default: gray** (matches training and the 1-channel camera path). Tell me if you want colour, which would also need colour frames in `main.cpp`.
-- **Q3 – backbone input channels.** The old xmodels take **1 channel** (normalization presumably folded into conv1, but the wrapper code isn't in the repo). Folding is **not exact** at zero-padded borders (per-channel mean/std differ), and the letterbox bars are large padded areas. **Default: 3-channel input, exact.** It costs 3× input bandwidth. The 1-channel fold is an option you can choose if bandwidth matters.
+- **Q3 – backbone input channels. ✅ Answered by your PTQ script: 3 channels** (gray stacked ×3, ImageNet mean/std per channel). The 1-channel shipped xmodels are obsolete.
+- **Q7 – template size (new).** The PTQ docstring says 256×256, the shipped xmodel is 128. **Default: whatever `cfg.TEST.TEMPLATE_SIZE` says.** The C++ derives `num_kernel=(size/16)²` from the config and checks it against the fusion_head input shape at startup, so a mismatch fails loudly instead of silently.
+- **Q8 – calibration data (new).** OK to calibrate on same-sequence GOT-10k pairs (template = GT crop, search = a later frame), as in S4? **Default: yes.**
 - **Q4 – missing config.** `experiments/lightfc/<name>.yaml` isn't in the repo. Unknown: `TEST.TEMPLATE_FACTOR`, `TEST.TEMPLATE_SIZE` (128 inferred from the 8×8 xmodel), `MODEL.HEAD.PARAMS.feat_sz` (assumed `[30,40]`), `FUSION.PARAMS.num_kernel/adj_channel` (assumed 64/96), `DATA.MEAN/STD` (assumed ImageNet = test code), `BACKBONE.STRIDE` (16). **I will not guess `template_factor`**: the C++ refuses to start until it's set. Please send the yaml.
 - **Q5 – lost-target handling.** `lib_orin` has none (always "tracking"). **Default: always Tracking, report `max_score`, optional threshold off.**
 - **Q6 – which fusion produced your checkpoint?** `pwcorr_2conv_sc_concat` (new, adds residuals) and `pwcorr_scf_sc_iab_sc_concat` (used by `LightFC`) have **identical state_dict keys**, so `strict=True` loading cannot tell them apart. **Default: `pwcorr_scf_sc_iab_sc_concat`** (what `tracker_model.py` builds). Please confirm the best checkpoint wasn't trained with the 2conv variant.
@@ -131,4 +156,4 @@ VART-free translation units only if OpenCV can be installed. I won't claim anyth
 - Latency/FPS target. Today the pipeline is "full-frame detection per frame", so you can't cut cost by shrinking a search region without changing the algorithm.
 
 ---
-**STOP: waiting for your approval of this plan (and answers to Q1–Q6, or "use defaults") before Phase 3.**
+**STOP: waiting for your approval of this plan (and answers to Q1, Q2, Q4–Q8, or "use defaults") before Phase 3.**
