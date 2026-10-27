@@ -616,6 +616,10 @@ def main():
     torch.manual_seed(args.seed)
     rng = random.Random(args.seed)
 
+    # Ampere+ GPUs run convs in TF32 by default (10-bit mantissa): keep the float reference true FP32,
+    # otherwise the float-vs-quant metrics and the corr check include TF32 noise.
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     part_output_dir = os.path.join(args.output_dir, args.part)
     os.makedirs(part_output_dir, exist_ok=True)
