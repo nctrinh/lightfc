@@ -57,6 +57,10 @@ It then runs the float path for all parts (including the equivalence check again
 if Vitis AI is absent, the calib/test control flow with a stub quantizer. It needs no checkpoint or dataset.
 
 ## Target-dependent (not hard-coded here)
+- **Match the board.** Read `xdputil query` on the board. Then (1) compile with an arch.json whose fingerprint equals
+  the board's: `arch/DPUCZDX8G_ISA1_B3136_kit.json` is the current kit (B3136, fingerprint `0x101000056010406`,
+  Vivado-flow DPU, not the KV260/ZCU102 B4096 presets), and (2) quantize and compile with the **same Vitis AI version
+  as the board runtime** (current kit: VART 3.0 on PetaLinux 2022.2, so use the Vitis AI 3.0 docker).
 - Step 3 and `pytorch_nndct` are Xilinx Vitis AI only. For another accelerator, start from the float ONNX
   (`--export_onnx`) and use that vendor's quantizer, calibrating with the same preprocessing.
 - The Vitis AI version must match the DPU IP on the board (fingerprint). The old models were built with
